@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 # Try to import psycopg (psycopg3) first, then fall back to psycopg2
 try:
-    from psycopg import sql
+    from psycopg import InterfaceError, OperationalError, sql
     from psycopg.types.json import Json
     from psycopg_pool import ConnectionPool
     PSYCOPG_VERSION = 3
@@ -17,7 +17,7 @@ try:
     logger.info("Using psycopg (psycopg3) with ConnectionPool for PostgreSQL connections")
 except ImportError:
     try:
-        from psycopg2 import sql
+        from psycopg2 import InterfaceError, OperationalError, sql
         from psycopg2.extras import Json, execute_values
         from psycopg2.pool import ThreadedConnectionPool as ConnectionPool
         PSYCOPG_VERSION = 2
@@ -328,6 +328,20 @@ class PGVector(VectorStoreBase):
                     data,
                 )
 
+    def _fetch_read(self, query, params=None, *, many):
+        """Retry a SELECT once if its checked-out connection was lost."""
+        for attempt in range(2):
+            cur = None
+            try:
+                with self._get_cursor() as cur:
+                    cur.execute(query, params)
+                    return cur.fetchall() if many else cur.fetchone()
+            except (InterfaceError, OperationalError):
+                # The pool discards the broken connection on return. A live connection
+                # can also raise OperationalError (e.g. query cancellation); don't retry it.
+                if attempt or cur is None or not cur.connection.closed:
+                    raise
+
     def search(
         self,
         query: str,
@@ -351,19 +365,17 @@ class PGVector(VectorStoreBase):
         filter_conditions, filter_params = _build_filter_conditions(filters)
         filter_clause = sql.SQL("WHERE " + " AND ".join(filter_conditions)) if filter_conditions else sql.SQL("")
 
-        with self._get_cursor() as cur:
-            cur.execute(
-                sql.SQL("""
+        results = self._fetch_read(
+            sql.SQL("""
                 SELECT id, vector <=> %s::vector AS distance, payload
                 FROM {}
                 {}
                 ORDER BY distance
                 LIMIT %s
                 """).format(self._col(), filter_clause),
-                (vectors, *filter_params, top_k),
-            )
-
-            results = cur.fetchall()
+            (vectors, *filter_params, top_k),
+            many=True,
+        )
         return [OutputData(id=str(r[0]), score=max(0.0, 1.0 - float(r[1])), payload=r[2]) for r in results]
 
     def keyword_search(self, query, top_k=5, filters=None):
@@ -464,15 +476,14 @@ class PGVector(VectorStoreBase):
             OutputData: Retrieved vector.
         """
         self._ensure_collection()
-        with self._get_cursor() as cur:
-            cur.execute(
-                sql.SQL("SELECT id, payload FROM {} WHERE id = %s").format(self._col()),
-                (vector_id,),
-            )
-            result = cur.fetchone()
-            if not result:
-                return None
-            return OutputData(id=str(result[0]), score=None, payload=result[1])
+        result = self._fetch_read(
+            sql.SQL("SELECT id, payload FROM {} WHERE id = %s").format(self._col()),
+            (vector_id,),
+            many=False,
+        )
+        if not result:
+            return None
+        return OutputData(id=str(result[0]), score=None, payload=result[1])
 
     def list_cols(self) -> List[str]:
         """
@@ -481,9 +492,10 @@ class PGVector(VectorStoreBase):
         Returns:
             List[str]: List of collection names.
         """
-        with self._get_cursor() as cur:
-            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-            return [row[0] for row in cur.fetchall()]
+        rows = self._fetch_read(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", many=True
+        )
+        return [row[0] for row in rows]
 
     def delete_col(self) -> None:
         """Delete a collection."""

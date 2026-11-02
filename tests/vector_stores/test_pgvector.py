@@ -4,11 +4,72 @@ import unittest
 import uuid
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mem0.vector_stores.pgvector import (
     PGVector,
     _build_filter_conditions,
     _with_sslmode,
 )
+
+
+@pytest.fixture
+def pooled_read():
+    driver = pytest.importorskip("psycopg")
+    pool = MagicMock()
+    store = PGVector("db", "memories", 2, "user", "pass", "localhost", 5432, False, False, connection_pool=pool)
+    store._collection_ensured = True
+
+    def connection(*, closed):
+        checkout = MagicMock()
+        conn = checkout.__enter__.return_value
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.connection = conn
+        conn.closed = closed
+        return checkout, cur
+
+    return store, pool, driver, connection
+
+
+@pytest.mark.parametrize("operation", ["get", "search"])
+def test_read_recovers_after_idle_disconnect(pooled_read, operation):
+    store, pool, driver, connection = pooled_read
+    stale, first = connection(closed=True)
+    fresh, second = connection(closed=False)
+    first.execute.side_effect = driver.OperationalError("server disconnected")
+    pool.connection.side_effect = [stale, fresh]
+    payload = {"data": "tea"}
+    if operation == "get":
+        second.fetchone.return_value = ("id", payload)
+        result = store.get("id")
+    else:
+        second.fetchall.return_value = [("id", 0.0, payload)]
+        (result,) = store.search("tea", [1.0, 0.0], filters={"user_id": "bob"})
+    assert result.payload == payload
+    first.execute.assert_called_once()
+    second.execute.assert_called_once_with(*first.execute.call_args.args)
+    assert pool.connection.call_count == 2
+
+
+@pytest.mark.parametrize("closed, attempts", [(False, 1), (True, 2)])
+def test_read_failure_is_bounded(pooled_read, closed, attempts):
+    store, pool, driver, connection = pooled_read
+    checkout, cur = connection(closed=closed)
+    cur.execute.side_effect = driver.OperationalError("read failed")
+    pool.connection.return_value = checkout
+    with pytest.raises(driver.OperationalError, match="read failed"):
+        store.get("id")
+    assert pool.connection.call_count == attempts
+
+
+def test_disconnected_update_is_not_replayed(pooled_read):
+    store, pool, driver, connection = pooled_read
+    checkout, cur = connection(closed=True)
+    cur.execute.side_effect = driver.OperationalError("write outcome unknown")
+    pool.connection.return_value = checkout
+    with pytest.raises(driver.OperationalError, match="write outcome unknown"):
+        store.update("id", payload={"data": "tea"})
+    assert pool.connection.call_count == 1
 
 
 class TestPGVector(unittest.TestCase):
