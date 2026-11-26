@@ -67,6 +67,40 @@ def test_search_vectors(langchain_instance):
     langchain_instance.client.similarity_search_by_vector.assert_called_with(embedding=vectors, k=2, filter=filters)
 
 
+@pytest.mark.parametrize(
+    ("filters", "expected_memories"),
+    [
+        (None, {"tea", "coffee", "water"}),
+        ({"user_id": "alice"}, {"tea", "coffee", "water"}),
+        ({"user_id": "alice", "agent_id": "planner"}, {"tea", "water"}),
+        ({"user_id": "alice", "agent_id": "planner", "run_id": "run-a"}, {"tea"}),
+        ({"user_id": "alice", "$or": [{"role": "assistant"}, {"role": "system"}]}, {"tea"}),
+    ],
+)
+def test_search_with_real_langchain_chroma(filters, expected_memories, tmp_path):
+    chromadb = pytest.importorskip("chromadb")
+    from langchain_community.vectorstores import Chroma
+
+    collection_name = f"mem0-{tmp_path.name}"
+    chroma = Chroma(collection_name=collection_name, client=chromadb.EphemeralClient())
+    try:
+        chroma._collection.add(
+            ids=["matching", "different-agent", "different-run"],
+            documents=["tea", "coffee", "water"],
+            embeddings=[[0.5, 0.0], [0.6, 0.0], [0.7, 0.0]],
+            metadatas=[
+                {"data": "tea", "user_id": "alice", "agent_id": "planner", "run_id": "run-a", "role": "assistant"},
+                {"data": "coffee", "user_id": "alice", "agent_id": "writer", "run_id": "run-a", "role": "user"},
+                {"data": "water", "user_id": "alice", "agent_id": "planner", "run_id": "run-b", "role": "user"},
+            ],
+        )
+        vector_store = Langchain(chroma, collection_name)
+        result = vector_store.search("drink", [0.0, 0.0], filters=filters)
+        assert {row.payload["data"] for row in result} == expected_memories
+    finally:
+        chroma.delete_collection()
+
+
 def test_search_vectors_with_agent_id_run_id_filters(langchain_instance):
     """Test search with agent_id and run_id filters."""
     # Mock search results

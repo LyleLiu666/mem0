@@ -108,6 +108,9 @@ class Langchain(VectorStoreBase):
         kwargs = {"embedding": vectors, "k": top_k}
         if filters:
             kwargs["filter"] = filters
+            if len(filters) > 1 and self._has_chroma_collection():
+                # Chroma expects one predicate at the root. Keep each existing clause intact.
+                kwargs["filter"] = {"$and": [{key: value} for key, value in filters.items()]}
 
         # Try methods that return (Document, float) pairs — not in the base contract
         # but available on several concrete implementations.
@@ -139,6 +142,17 @@ class Langchain(VectorStoreBase):
             )
             for doc in docs
         ]
+
+    def _has_chroma_collection(self) -> bool:
+        collection = getattr(self.client, "_collection", None)
+        if collection is None:
+            return False
+
+        try:
+            from chromadb.api.models.Collection import Collection
+        except ImportError:
+            return False
+        return isinstance(collection, Collection)
 
     def delete(self, vector_id):
         """
